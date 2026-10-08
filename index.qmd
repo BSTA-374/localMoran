@@ -19,6 +19,13 @@ format:
     fig-align: center
     df-print: kable
     embed-resources: true
+  pdf:
+    papersize: letter
+    geometry:
+      - margin=1in
+    toc: false
+    colorlinks: true
+    code-overflow: wrap
 execute:
   warning: false
   message: false
