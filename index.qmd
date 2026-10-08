@@ -1,0 +1,226 @@
+---
+title: "Local Moran's I"
+subtitle: "Where are the clusters? Lung cancer in Pennsylvania"
+author: "Eric M. Delmelle · Lehigh University"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    toc-title: "On this page"
+    number-sections: true
+    code-fold: show
+    code-copy: true
+    code-tools: true
+    highlight-style: github
+    fig-width: 7
+    fig-height: 4.5
+    fig-align: center
+    df-print: kable
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Where we left off {.unnumbered}
+
+Global Moran's I told us that lung cancer SIRs in Pennsylvania are spatially
+autocorrelated: similar values tend to sit next to each other. It did not tell
+us *where*. Today we break that single number into 67 pieces, one per county.
+Reading: **Rogerson & Yamada Ch. 4**.
+
+```{r}
+#| label: setup
+#| code-fold: false
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(spdep)
+library(SpatialEpi)   # pennLC
+
+theme_set(theme_void(base_size = 12))
+```
+
+# Data and weights (recap)
+
+Same SIRs and queen-contiguity weights as last time, in one chunk.
+
+```{r}
+#| label: recap
+#| code-fold: true
+
+data(pennLC)
+d <- pennLC$data
+
+ref <- d |>
+  group_by(race, gender, age) |>
+  summarise(r = sum(cases) / sum(population), .groups = "drop")   # reference rates
+
+county <- d |>
+  left_join(ref, by = c("race", "gender", "age")) |>
+  group_by(county) |>
+  summarise(O = sum(cases), E = sum(population * r), .groups = "drop") |>
+  mutate(SIR = O / E)
+
+pa <- st_as_sf(pennLC$spatial.polygon) |>
+  st_set_crs(4326) |>
+  mutate(county = names(pennLC$spatial.polygon)) |>
+  st_transform(5070) |>                                           # Albers
+  left_join(county, by = "county")
+
+nb <- poly2nb(pa, queen = TRUE)
+lw <- nb2listw(nb, style = "W")                                   # row-standardized
+
+sir_breaks <- c(0, 0.67, 0.83, 0.95, 1.05, 1.2, 1.5, Inf)
+sir_fill   <- scale_fill_brewer(palette = "RdBu", direction = -1, drop = FALSE, name = "SIR")
+
+moran.test(pa$SIR, lw)$estimate[1]                                # global I
+```
+
+```{r}
+#| label: fig-sir
+#| fig-cap: "Lung cancer SIRs, Pennsylvania 2002."
+
+ggplot(pa) +
+  geom_sf(aes(fill = cut(SIR, sir_breaks)), colour = "white", linewidth = 0.2) +
+  sir_fill
+```
+
+# From global to local
+
+## One number per county
+
+Center the SIRs, $z_i = x_i - \bar x$. Global Moran's I (row-standardized
+weights) is
+
+$$
+I = \frac{\sum_i z_i \sum_j w_{ij} z_j}{\sum_i z_i^2}.
+$$
+
+The numerator is a sum over counties. Pull out each county's term and you get
+**local Moran's I** (Anselin 1995):
+
+$$
+I_i = \frac{z_i}{m_2} \sum_j w_{ij} z_j, \qquad m_2 = \frac{\sum_i z_i^2}{n}.
+$$
+
+In words: **(my deviation) × (my neighbours' average deviation)**, scaled by
+the variance. Averaging the $I_i$ gives back the global $I$.
+
+| My SIR | Neighbours' SIR | Sign of $I_i$ | Type |
+|---|---|---|---|
+| above mean | above mean | + | High-High |
+| below mean | below mean | + | Low-Low |
+| above mean | below mean | − | High-Low |
+| below mean | above mean | − | Low-High |
+
+## Computing it
+
+`localmoran_perm()` returns $I_i$, a $p$-value, and the quadrant for every
+county.
+
+```{r}
+#| label: lisa
+
+set.seed(374)
+lisa <- localmoran_perm(pa$SIR, lw, nsim = 999)
+
+pa <- pa |>
+  mutate(
+    Ii    = lisa[, "Ii"],
+    p_sim = lisa[, "Pr(z != E(Ii)) Sim"],                   # p-value
+    quad  = as.character(attr(lisa, "quadr")$mean)          # quadrant
+  )
+```
+
+# The LISA cluster map
+
+Colour significant counties by quadrant; everything else grey.
+
+```{r}
+#| label: fig-lisa
+#| fig-height: 4
+#| fig-cap: "SIR (left) and LISA clusters at p < 0.05 (right)."
+
+lisa_cols <- c("High-High" = "#d7191c", "Low-Low"  = "#2c7bb6",
+               "High-Low"  = "#fdae61", "Low-High" = "#abd9e9",
+               "Not significant" = "grey92")
+
+pa <- pa |>
+  mutate(cluster = factor(if_else(p_sim < 0.05, quad, "Not significant"),
+                          levels = names(lisa_cols)))
+
+m_sir <- ggplot(pa) +
+  geom_sf(aes(fill = cut(SIR, sir_breaks)), colour = "white", linewidth = 0.2) +
+  sir_fill
+
+m_lisa <- ggplot(pa) +
+  geom_sf(aes(fill = cluster), colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = lisa_cols, drop = FALSE, name = NULL)
+
+m_sir | m_lisa
+```
+
+```{r}
+#| label: lisa-table
+
+pa |>
+  st_drop_geometry() |>
+  filter(cluster != "Not significant") |>
+  arrange(cluster, p_sim) |>
+  transmute(county, cluster, O, E = round(E, 1),
+            SIR = round(SIR, 2), Ii = round(Ii, 2), p_sim)
+```
+
+## Reading the map
+
+- **High-High** (hot spot): high SIR, surrounded by high SIRs.
+- **Low-Low** (cold spot): low SIR, surrounded by low SIRs.
+- **High-Low / Low-High** (spatial outliers): a county that breaks from its
+  surroundings.
+
+Two cautions. A coloured county is the *core* of a local pattern; its
+neighbours are part of it even when they stay grey. And look at $E_i$ in the
+table: a county with few expected cases can produce an extreme SIR, and a
+"cluster" by chance. We return to how many counties we are testing at once
+next session.
+
+# If you want to challenge yourself: build and read a LISA map {.unnumbered}
+
+20 minutes.
+
+1. Change the weights to the **four nearest neighbours**:
+
+   ```r
+   pts <- st_point_on_surface(st_geometry(pa))
+   nb4 <- knn2nb(knearneigh(st_coordinates(pts), k = 4))
+   lw4 <- nb2listw(nb4, style = "W")
+   ```
+
+   Rerun `localmoran_perm()` with `lw4` (same seed) and redraw the LISA map.
+   Which counties keep their label? Which change?
+2. Pick one High-High county. Report its SIR, $E_i$, and the SIRs of its
+   neighbours. Does the label make sense to you?
+3. In one sentence for a county health officer, explain what a Low-High
+   outlier means.
+
+# Key takeaways {.unnumbered}
+
+1. Local Moran's I splits global I into one value per county: own deviation ×
+   neighbours' average deviation.
+2. Positive $I_i$: like the neighbours (High-High, Low-Low). Negative $I_i$:
+   unlike them (High-Low, Low-High).
+3. The LISA map combines type and significance; read it alongside $E_i$ and
+   the choice of neighbours.
+
+# References {.unnumbered}
+
+Anselin, L. (1995). Local indicators of spatial association---LISA.
+*Geographical Analysis*, 27(2), 93--115.
+
+Rogerson, P., & Yamada, I. (2009). *Statistical detection and surveillance of
+geographic clusters*. Chapman & Hall/CRC, Ch. 4.
